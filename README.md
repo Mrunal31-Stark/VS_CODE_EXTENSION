@@ -107,3 +107,7 @@ npx tsc
 ## 🙌 Made  by MRUNAL
 '''
 
+![image](https://github.com/user-attachments/assets/10af6fa2-1024-44db-9fc7-bf6d0eb59ad6)
+
+![image](https://github.com/user-attachments/assets/e8185018-88b3-42e1-806a-f01298e4dfea)
+
