@@ -1,106 +1,124 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
-
 import * as vscode from 'vscode';
-import { LanguageClient } from 'vscode-languageclient/node';
-import { registerLogger, traceError, traceLog, traceVerbose } from './common/log/logging';
-import {
-    checkVersion,
-    getInterpreterDetails,
-    initializePython,
-    onDidChangePythonInterpreter,
-    resolveInterpreter,
-} from './common/python';
-import { restartServer } from './common/server';
-import { checkIfConfigurationChanged, getInterpreterFromSetting } from './common/settings';
-import { loadServerDefaults } from './common/setup';
-import { getLSClientTraceLevel } from './common/utilities';
-import { createOutputChannel, onDidChangeConfiguration, registerCommand } from './common/vscodeapi';
+import * as cp from 'child_process';
+import * as path from 'path';
 
-let lsClient: LanguageClient | undefined;
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    // This is required to get server name and module. This should be
-    // the first thing that we do in this extension.
-    const serverInfo = loadServerDefaults();
-    const serverName = serverInfo.name;
-    const serverId = serverInfo.module;
+/**
+ * Class responsible for analyzing Python functions in selected folders.
+ */
+class PythonFunctionAnalyzer {
+  private context: vscode.ExtensionContext;
 
-    // Setup logging
-    const outputChannel = createOutputChannel(serverName);
-    context.subscriptions.push(outputChannel, registerLogger(outputChannel));
+  constructor(context: vscode.ExtensionContext) {
+    this.context = context;
+    this.registerCommands();
+  }
 
-    const changeLogLevel = async (c: vscode.LogLevel, g: vscode.LogLevel) => {
-        const level = getLSClientTraceLevel(c, g);
-        await lsClient?.setTrace(level);
-    };
-
-    context.subscriptions.push(
-        outputChannel.onDidChangeLogLevel(async (e) => {
-            await changeLogLevel(e, vscode.env.logLevel);
-        }),
-        vscode.env.onDidChangeLogLevel(async (e) => {
-            await changeLogLevel(outputChannel.logLevel, e);
-        }),
+  /**
+   * Registers all extension commands.
+   */
+  private registerCommands() {
+    const disposable = vscode.commands.registerCommand(
+      'extension.analyzePythonFunctions',
+      () => this.handleAnalyzeCommand()
     );
 
-    // Log Server information
-    traceLog(`Name: ${serverInfo.name}`);
-    traceLog(`Module: ${serverInfo.module}`);
-    traceVerbose(`Full Server Info: ${JSON.stringify(serverInfo)}`);
+    this.context.subscriptions.push(disposable);
+  }
 
-    const runServer = async () => {
-        const interpreter = getInterpreterFromSetting(serverId);
-        if (interpreter && interpreter.length > 0) {
-            if (checkVersion(await resolveInterpreter(interpreter))) {
-                traceVerbose(`Using interpreter from ${serverInfo.module}.interpreter: ${interpreter.join(' ')}`);
-                lsClient = await restartServer(serverId, serverName, outputChannel, lsClient);
-            }
-            return;
-        }
-
-        const interpreterDetails = await getInterpreterDetails();
-        if (interpreterDetails.path) {
-            traceVerbose(`Using interpreter from Python extension: ${interpreterDetails.path.join(' ')}`);
-            lsClient = await restartServer(serverId, serverName, outputChannel, lsClient);
-            return;
-        }
-
-        traceError(
-            'Python interpreter missing:\r\n' +
-                '[Option 1] Select python interpreter using the ms-python.python.\r\n' +
-                `[Option 2] Set an interpreter using "${serverId}.interpreter" setting.\r\n` +
-                'Please use Python 3.8 or greater.',
-        );
-    };
-
-    context.subscriptions.push(
-        onDidChangePythonInterpreter(async () => {
-            await runServer();
-        }),
-        onDidChangeConfiguration(async (e: vscode.ConfigurationChangeEvent) => {
-            if (checkIfConfigurationChanged(e, serverId)) {
-                await runServer();
-            }
-        }),
-        registerCommand(`${serverId}.restart`, async () => {
-            await runServer();
-        }),
-    );
-
-    setImmediate(async () => {
-        const interpreter = getInterpreterFromSetting(serverId);
-        if (interpreter === undefined || interpreter.length === 0) {
-            traceLog(`Python extension loading`);
-            await initializePython(context.subscriptions);
-            traceLog(`Python extension loaded`);
-        } else {
-            await runServer();
-        }
+  /**
+   * Handles the execution flow when the command is triggered.
+   */
+  private async handleAnalyzeCommand() {
+    const folderUri = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      openLabel: "Select Folder to Analyze"
     });
+
+    if (!folderUri || folderUri.length === 0) {
+      vscode.window.showWarningMessage("No folder selected.");
+      return;
+    }
+
+    const folderPath = folderUri[0].fsPath;
+    const scriptPath = this.context.asAbsolutePath(path.join('pythonFiles', 'analyze_functions.py'));
+
+    this.runPythonScript(scriptPath, folderPath);
+  }
+
+  /**
+   * Runs the Python script and processes its output.
+   */
+  private runPythonScript(scriptPath: string, folderPath: string) {
+    const process = cp.spawn('python', [scriptPath, folderPath]);
+
+    let output = '';
+    let errorOutput = '';
+
+    process.stdout.on('data', (chunk) => output += chunk);
+    process.stderr.on('data', (err) => errorOutput += err);
+
+    process.on('close', () => {
+      if (errorOutput) {
+        console.error("Python Error:", errorOutput);
+        vscode.window.showErrorMessage("Python script failed. Check the console.");
+        return;
+      }
+
+      try {
+        const result = JSON.parse(output.trim());
+        this.showResultsInWebview(result);
+      } catch (err) {
+        console.error("Parsing Error:", err);
+        vscode.window.showErrorMessage("Failed to parse Python output.");
+      }
+    });
+  }
+
+  /**
+   * Renders the results into a WebView panel.
+   */
+  private showResultsInWebview(result: Record<string, number>) {
+    const panel = vscode.window.createWebviewPanel(
+      'functionAnalyzer',
+      'Function Count Analysis',
+      vscode.ViewColumn.One,
+      {}
+    );
+
+    const htmlList = Object.entries(result)
+      .map(([file, count]) => `<li><code>${file}</code>: ${count} function${count !== 1 ? 's' : ''}</li>`)
+      .join('');
+
+    panel.webview.html = `
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <style>
+          body { font-family: sans-serif; padding: 1rem; }
+          h2 { color: #007acc; }
+          ul { padding-left: 1.2rem; }
+          li { margin-bottom: 4px; }
+        </style>
+      </head>
+      <body>
+        <h2>📊 Function Count Analysis</h2>
+        <ul>${htmlList}</ul>
+      </body>
+      </html>
+    `;
+  }
 }
 
-export async function deactivate(): Promise<void> {
-    if (lsClient) {
-        await lsClient.stop();
-    }
+/**
+ * This method is called when the extension is activated.
+ */
+export function activate(context: vscode.ExtensionContext) {
+  new PythonFunctionAnalyzer(context);
+}
+
+/**
+ * This method is called when the extension is deactivated.
+ */
+export function deactivate() {
+  // Cleanup if needed
 }
